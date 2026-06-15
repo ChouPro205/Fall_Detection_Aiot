@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <stdbool.h>
+#include <inttypes.h>
+#include <math.h>
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -8,6 +10,7 @@
 #include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "app_config.h"
 
 static const char *TAG = "FALL_DETECTION_SYSTEM";
@@ -20,8 +23,20 @@ static const uint8_t MPU6050_REG_GYRO_CONFIG = 0x1B;
 static const uint8_t MPU6050_REG_ACCEL_CONFIG = 0x1C;
 static const uint8_t MPU6050_REG_WHO_AM_I = 0x75;
 static const uint8_t MPU6050_WHO_AM_I_VALUE = 0x68;
+static const float MPU6050_ACCEL_SCALE = 16384.0f;
+static const float MPU6050_GYRO_SCALE = 131.0f;
 static i2c_master_bus_handle_t i2c_bus_handle = NULL;
 static i2c_master_dev_handle_t mpu6050_dev_handle = NULL;
+
+typedef struct {
+    int64_t timestamp_ms;
+    float ax_g;
+    float ay_g;
+    float az_g;
+    float gx_dps;
+    float gy_dps;
+    float gz_dps;
+} sensor_sample_t;
 
 void led_set(bool on);
 void buzzer_set(bool on);
@@ -260,40 +275,90 @@ QueueHandle_t alert_queue;
 // --- TASK 1: Đọc cảm biến (Mức ưu tiên cao nhất - Real-time) ---
 void vSensorTask(void *pvParameters) {
     ESP_LOGI(TAG, "Sensor Task Started");
-    TickType_t last_log_tick = 0;
+    TickType_t last_wake_tick = xTaskGetTickCount();
+    TickType_t last_queue_warning_tick = 0;
+    const TickType_t sample_period_ticks = pdMS_TO_TICKS(SENSOR_SAMPLE_PERIOD_MS);
 
     while (1) {
         // Sau này: Đọc MPU6050 qua I2C tại đây
         // Tần số lý tưởng cho AI phát hiện té ngã là 50Hz (20ms)
-        int16_t ax = 0;
-        int16_t ay = 0;
-        int16_t az = 0;
-        int16_t gx = 0;
-        int16_t gy = 0;
-        int16_t gz = 0;
-        esp_err_t err = mpu6050_read_raw(&ax, &ay, &az, &gx, &gy, &gz);
+        int16_t ax_raw = 0;
+        int16_t ay_raw = 0;
+        int16_t az_raw = 0;
+        int16_t gx_raw = 0;
+        int16_t gy_raw = 0;
+        int16_t gz_raw = 0;
+        esp_err_t err = mpu6050_read_raw(&ax_raw, &ay_raw, &az_raw, &gx_raw, &gy_raw, &gz_raw);
 
-        TickType_t now = xTaskGetTickCount();
-        if ((now - last_log_tick) >= pdMS_TO_TICKS(1000)) {
-            if (err == ESP_OK) {
-                ESP_LOGI(TAG, "MPU6050 raw: ax=%d ay=%d az=%d gx=%d gy=%d gz=%d", ax, ay, az, gx, gy, gz);
-            } else {
-                ESP_LOGW(TAG, "Failed to read MPU6050 raw data: %s", esp_err_to_name(err));
+        if (err == ESP_OK) {
+            sensor_sample_t sample = {
+                .timestamp_ms = esp_timer_get_time() / 1000,
+                .ax_g = (float)ax_raw / MPU6050_ACCEL_SCALE,
+                .ay_g = (float)ay_raw / MPU6050_ACCEL_SCALE,
+                .az_g = (float)az_raw / MPU6050_ACCEL_SCALE,
+                .gx_dps = (float)gx_raw / MPU6050_GYRO_SCALE,
+                .gy_dps = (float)gy_raw / MPU6050_GYRO_SCALE,
+                .gz_dps = (float)gz_raw / MPU6050_GYRO_SCALE,
+            };
+
+            if (xQueueSend(sensor_data_queue, &sample, 0) != pdPASS) {
+                TickType_t now = xTaskGetTickCount();
+                if ((now - last_queue_warning_tick) >= pdMS_TO_TICKS(1000)) {
+                    ESP_LOGW(TAG, "sensor_data_queue full, dropping sample");
+                    last_queue_warning_tick = now;
+                }
             }
-            last_log_tick = now;
+        } else {
+            TickType_t now = xTaskGetTickCount();
+            if ((now - last_queue_warning_tick) >= pdMS_TO_TICKS(1000)) {
+                ESP_LOGW(TAG, "Failed to read MPU6050 raw data: %s", esp_err_to_name(err));
+                last_queue_warning_tick = now;
+            }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_SAMPLE_PERIOD_MS));
+        vTaskDelayUntil(&last_wake_tick, sample_period_ticks);
     }
 }
 
 // --- TASK 2: Xử lý AI/TinyML (Mức ưu tiên trung bình cao) ---
 void vInferenceTask(void *pvParameters) {
     ESP_LOGI(TAG, "AI Inference Task Started");
+    TickType_t last_log_tick = 0;
+
     while (1) {
         // Sau này: Nhận dữ liệu từ sensor_data_queue và chạy model Edge Impulse
         // AI thường xử lý theo cửa sổ thời gian (ví dụ 2 giây một lần)
-        vTaskDelay(pdMS_TO_TICKS(500));
+        sensor_sample_t sample;
+        if (xQueueReceive(sensor_data_queue, &sample, portMAX_DELAY) == pdPASS) {
+            TickType_t now = xTaskGetTickCount();
+            if ((now - last_log_tick) >= pdMS_TO_TICKS(1000)) {
+                float accel_magnitude = sqrtf(
+                    (sample.ax_g * sample.ax_g) +
+                    (sample.ay_g * sample.ay_g) +
+                    (sample.az_g * sample.az_g)
+                );
+                float gyro_magnitude = sqrtf(
+                    (sample.gx_dps * sample.gx_dps) +
+                    (sample.gy_dps * sample.gy_dps) +
+                    (sample.gz_dps * sample.gz_dps)
+                );
+
+                ESP_LOGI(
+                    TAG,
+                    "Sensor sample: t=%" PRId64 "ms ax=%.3fg ay=%.3fg az=%.3fg gx=%.2fdps gy=%.2fdps gz=%.2fdps A=%.3fg G=%.2fdps",
+                    sample.timestamp_ms,
+                    sample.ax_g,
+                    sample.ay_g,
+                    sample.az_g,
+                    sample.gx_dps,
+                    sample.gy_dps,
+                    sample.gz_dps,
+                    accel_magnitude,
+                    gyro_magnitude
+                );
+                last_log_tick = now;
+            }
+        }
     }
 }
 
@@ -353,7 +418,7 @@ void app_main(void)
     }
 
     // 1. Khởi tạo các Queue (Truyền tin giữa các Task)
-    sensor_data_queue = xQueueCreate(10, sizeof(float) * 6); // Chứa 6 trục dữ liệu
+    sensor_data_queue = xQueueCreate(10, sizeof(sensor_sample_t)); // Normalized sensor samples
     alert_queue = xQueueCreate(5, sizeof(bool));            // Chứa trạng thái Té ngã (True/False)
 
     // 2. Tạo các Task
