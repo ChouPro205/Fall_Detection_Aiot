@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -11,13 +12,27 @@
 
 static const char *TAG = "FALL_DETECTION_SYSTEM";
 static const int I2C_SCAN_TIMEOUT_MS = 50;
+static const int I2C_DEVICE_TIMEOUT_MS = 100;
+static const uint32_t I2C_DEVICE_SPEED_HZ = 100000;
+static const uint8_t MPU6050_REG_ACCEL_XOUT_H = 0x3B;
+static const uint8_t MPU6050_REG_PWR_MGMT_1 = 0x6B;
+static const uint8_t MPU6050_REG_GYRO_CONFIG = 0x1B;
+static const uint8_t MPU6050_REG_ACCEL_CONFIG = 0x1C;
+static const uint8_t MPU6050_REG_WHO_AM_I = 0x75;
+static const uint8_t MPU6050_WHO_AM_I_VALUE = 0x68;
 static i2c_master_bus_handle_t i2c_bus_handle = NULL;
+static i2c_master_dev_handle_t mpu6050_dev_handle = NULL;
 
 void led_set(bool on);
 void buzzer_set(bool on);
 bool button_is_pressed(void);
 esp_err_t board_i2c_init(void);
 void i2c_scan(void);
+esp_err_t mpu6050_write_reg(uint8_t reg, uint8_t data);
+esp_err_t mpu6050_read_reg(uint8_t reg, uint8_t *data);
+esp_err_t mpu6050_read_bytes(uint8_t start_reg, uint8_t *buffer, size_t len);
+esp_err_t mpu6050_init(void);
+esp_err_t mpu6050_read_raw(int16_t *ax, int16_t *ay, int16_t *az, int16_t *gx, int16_t *gy, int16_t *gz);
 
 esp_err_t board_gpio_init(void)
 {
@@ -111,6 +126,131 @@ void i2c_scan(void)
     }
 }
 
+static esp_err_t mpu6050_get_device_handle(void)
+{
+    if (mpu6050_dev_handle != NULL) {
+        return ESP_OK;
+    }
+
+    if (i2c_bus_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    i2c_device_config_t dev_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = MPU6050_I2C_ADDR,
+        .scl_speed_hz = I2C_DEVICE_SPEED_HZ,
+    };
+
+    return i2c_master_bus_add_device(i2c_bus_handle, &dev_config, &mpu6050_dev_handle);
+}
+
+static int16_t mpu6050_parse_int16(uint8_t high_byte, uint8_t low_byte)
+{
+    return (int16_t)(((uint16_t)high_byte << 8) | low_byte);
+}
+
+esp_err_t mpu6050_write_reg(uint8_t reg, uint8_t data)
+{
+    esp_err_t err = mpu6050_get_device_handle();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uint8_t write_buffer[2] = {reg, data};
+    return i2c_master_transmit(mpu6050_dev_handle, write_buffer, sizeof(write_buffer), I2C_DEVICE_TIMEOUT_MS);
+}
+
+esp_err_t mpu6050_read_reg(uint8_t reg, uint8_t *data)
+{
+    if (data == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return mpu6050_read_bytes(reg, data, 1);
+}
+
+esp_err_t mpu6050_read_bytes(uint8_t start_reg, uint8_t *buffer, size_t len)
+{
+    if (buffer == NULL || len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = mpu6050_get_device_handle();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return i2c_master_transmit_receive(
+        mpu6050_dev_handle,
+        &start_reg,
+        sizeof(start_reg),
+        buffer,
+        len,
+        I2C_DEVICE_TIMEOUT_MS
+    );
+}
+
+esp_err_t mpu6050_init(void)
+{
+    uint8_t who_am_i = 0;
+    esp_err_t err = mpu6050_read_reg(MPU6050_REG_WHO_AM_I, &who_am_i);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read MPU6050 WHO_AM_I: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "MPU6050 WHO_AM_I = 0x%02X", who_am_i);
+    if (who_am_i != MPU6050_WHO_AM_I_VALUE) {
+        ESP_LOGE(TAG, "Unexpected MPU6050 WHO_AM_I value");
+        return ESP_FAIL;
+    }
+
+    err = mpu6050_write_reg(MPU6050_REG_PWR_MGMT_1, 0x00);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to wake up MPU6050: %s", esp_err_to_name(err));
+        return err;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    err = mpu6050_write_reg(MPU6050_REG_ACCEL_CONFIG, 0x00);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure MPU6050 accelerometer: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = mpu6050_write_reg(MPU6050_REG_GYRO_CONFIG, 0x00);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure MPU6050 gyroscope: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "MPU6050 initialized");
+    return ESP_OK;
+}
+
+esp_err_t mpu6050_read_raw(int16_t *ax, int16_t *ay, int16_t *az, int16_t *gx, int16_t *gy, int16_t *gz)
+{
+    if (ax == NULL || ay == NULL || az == NULL || gx == NULL || gy == NULL || gz == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t data[14] = {0};
+    esp_err_t err = mpu6050_read_bytes(MPU6050_REG_ACCEL_XOUT_H, data, sizeof(data));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    *ax = mpu6050_parse_int16(data[0], data[1]);
+    *ay = mpu6050_parse_int16(data[2], data[3]);
+    *az = mpu6050_parse_int16(data[4], data[5]);
+    *gx = mpu6050_parse_int16(data[8], data[9]);
+    *gy = mpu6050_parse_int16(data[10], data[11]);
+    *gz = mpu6050_parse_int16(data[12], data[13]);
+
+    return ESP_OK;
+}
+
 // --- KHAI BÁO HÀNG ĐỢI (QUEUES) ---
 // Dùng để truyền dữ liệu thô từ cảm biến sang Task xử lý AI
 QueueHandle_t sensor_data_queue;
@@ -120,10 +260,30 @@ QueueHandle_t alert_queue;
 // --- TASK 1: Đọc cảm biến (Mức ưu tiên cao nhất - Real-time) ---
 void vSensorTask(void *pvParameters) {
     ESP_LOGI(TAG, "Sensor Task Started");
+    TickType_t last_log_tick = 0;
+
     while (1) {
         // Sau này: Đọc MPU6050 qua I2C tại đây
         // Tần số lý tưởng cho AI phát hiện té ngã là 50Hz (20ms)
-        vTaskDelay(pdMS_TO_TICKS(20)); 
+        int16_t ax = 0;
+        int16_t ay = 0;
+        int16_t az = 0;
+        int16_t gx = 0;
+        int16_t gy = 0;
+        int16_t gz = 0;
+        esp_err_t err = mpu6050_read_raw(&ax, &ay, &az, &gx, &gy, &gz);
+
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_log_tick) >= pdMS_TO_TICKS(1000)) {
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "MPU6050 raw: ax=%d ay=%d az=%d gx=%d gy=%d gz=%d", ax, ay, az, gx, gy, gz);
+            } else {
+                ESP_LOGW(TAG, "Failed to read MPU6050 raw data: %s", esp_err_to_name(err));
+            }
+            last_log_tick = now;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_SAMPLE_PERIOD_MS));
     }
 }
 
@@ -185,6 +345,12 @@ void app_main(void)
         return;
     }
     i2c_scan();
+
+    err = mpu6050_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize MPU6050: %s", esp_err_to_name(err));
+        return;
+    }
 
     // 1. Khởi tạo các Queue (Truyền tin giữa các Task)
     sensor_data_queue = xQueueCreate(10, sizeof(float) * 6); // Chứa 6 trục dữ liệu
