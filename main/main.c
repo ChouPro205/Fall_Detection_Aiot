@@ -1,11 +1,67 @@
 #include <stdio.h>
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "driver/gpio.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "app_config.h"
 
 static const char *TAG = "FALL_DETECTION_SYSTEM";
+
+void led_set(bool on);
+void buzzer_set(bool on);
+bool button_is_pressed(void);
+
+esp_err_t board_gpio_init(void)
+{
+    gpio_config_t output_config = {
+        .pin_bit_mask = (1ULL << LED_GPIO) | (1ULL << BUZZER_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    esp_err_t err = gpio_config(&output_config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    gpio_config_t button_config = {
+        .pin_bit_mask = (1ULL << BUTTON_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    err = gpio_config(&button_config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    led_set(false);
+    buzzer_set(false);
+
+    return ESP_OK;
+}
+
+void led_set(bool on)
+{
+    gpio_set_level(LED_GPIO, on ? 1 : 0);
+}
+
+void buzzer_set(bool on)
+{
+    gpio_set_level(BUZZER_GPIO, on ? 1 : 0);
+}
+
+bool button_is_pressed(void)
+{
+    return gpio_get_level(BUTTON_GPIO) == 0;
+}
 
 // --- KHAI BÁO HÀNG ĐỢI (QUEUES) ---
 // Dùng để truyền dữ liệu thô từ cảm biến sang Task xử lý AI
@@ -46,10 +102,21 @@ void vNetworkTask(void *pvParameters) {
 // --- TASK 4: Cảnh báo tại chỗ & Giám sát hệ thống (Buzzer/Pin) ---
 void vSystemMonitorTask(void *pvParameters) {
     ESP_LOGI(TAG, "System Monitor Task Started");
+    led_set(false);
+    buzzer_set(false);
+
+    bool last_button_pressed = button_is_pressed();
+
     while (1) {
         // Sau này: Đọc ADC kiểm tra pin (TP4056), chớp LED trạng thái
         // Kích hoạt loa (Buzzer) nếu phát hiện té ngã
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        bool button_pressed = button_is_pressed();
+        if (button_pressed != last_button_pressed) {
+            ESP_LOGI(TAG, "Button: %s", button_pressed ? "PRESSED" : "RELEASED");
+            last_button_pressed = button_pressed;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -58,22 +125,48 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Initializing Fall Detection System...");
 
+    esp_err_t err = board_gpio_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize board GPIO: %s", esp_err_to_name(err));
+        return;
+    }
+
     // 1. Khởi tạo các Queue (Truyền tin giữa các Task)
     sensor_data_queue = xQueueCreate(10, sizeof(float) * 6); // Chứa 6 trục dữ liệu
     alert_queue = xQueueCreate(5, sizeof(bool));            // Chứa trạng thái Té ngã (True/False)
 
     // 2. Tạo các Task
     // Task đọc cảm biến (Priority: 5) - Cần chạy cực kỳ đúng giờ
-    xTaskCreate(vSensorTask, "Sensor_Read", 4096, NULL, 5, NULL);
+    if (sensor_data_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create sensor_data_queue");
+        return;
+    }
+    if (alert_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create alert_queue");
+        return;
+    }
+    if (xTaskCreate(vSensorTask, "Sensor_Read", 4096, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create Sensor_Read task");
+        return;
+    }
 
     // Task chạy AI (Priority: 4) - Xử lý tính toán nặng
-    xTaskCreate(vInferenceTask, "AI_Inference", 8192, NULL, 4, NULL);
+    if (xTaskCreate(vInferenceTask, "AI_Inference", 8192, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create AI_Inference task");
+        return;
+    }
 
     // Task mạng (Priority: 3) - Kết nối WiFi/MQTT
-    xTaskCreate(vNetworkTask, "Network_Alert", 8192, NULL, 3, NULL);
+    if (xTaskCreate(vNetworkTask, "Network_Alert", 8192, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create Network_Alert task");
+        return;
+    }
 
     // Task hệ thống (Priority: 2) - Quản lý pin, LED, còi
-    xTaskCreate(vSystemMonitorTask, "Sys_Monitor", 2048, NULL, 2, NULL);
+    if (xTaskCreate(vSystemMonitorTask, "Sys_Monitor", 2048, NULL, 2, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create Sys_Monitor task");
+        return;
+    }
 
     ESP_LOGI(TAG, "All Tasks Created Successfully.");
 }
