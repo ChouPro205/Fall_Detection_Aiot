@@ -12,6 +12,8 @@
 #include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_event.h"
+#include "esp_crt_bundle.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
@@ -23,6 +25,12 @@
 #include "wifi_credentials.h"
 #else
 #include "wifi_credentials_example.h"
+#endif
+
+#if __has_include("telegram_credentials.h")
+#include "telegram_credentials.h"
+#else
+#include "telegram_credentials_example.h"
 #endif
 
 static const char *TAG = "FALL_DETECTION_SYSTEM";
@@ -92,6 +100,7 @@ esp_err_t app_nvs_init(void);
 esp_err_t board_i2c_init(void);
 void i2c_scan(void);
 esp_err_t wifi_init_sta(void);
+esp_err_t telegram_send_message(const char *message);
 esp_err_t mpu6050_write_reg(uint8_t reg, uint8_t data);
 esp_err_t mpu6050_read_reg(uint8_t reg, uint8_t *data);
 esp_err_t mpu6050_read_bytes(uint8_t start_reg, uint8_t *buffer, size_t len);
@@ -244,6 +253,82 @@ esp_err_t wifi_init_sta(void)
 
     ESP_LOGI(TAG, "WiFi station initialized");
     return ESP_OK;
+}
+
+esp_err_t telegram_send_message(const char *message)
+{
+    if (message == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_LOGI(TAG, "Telegram message sending...");
+
+    if (strcmp(TELEGRAM_BOT_TOKEN, "YOUR_TELEGRAM_BOT_TOKEN") == 0 ||
+        strcmp(TELEGRAM_CHAT_ID, "YOUR_TELEGRAM_CHAT_ID") == 0) {
+        ESP_LOGW(TAG, "Telegram credentials are placeholders. Create main/telegram_credentials.h before testing Telegram.");
+        ESP_LOGE(TAG, "Telegram message failed");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char url[256] = {0};
+    int written = snprintf(
+        url,
+        sizeof(url),
+        "https://api.telegram.org/bot%s/sendMessage",
+        TELEGRAM_BOT_TOKEN
+    );
+    if (written < 0 || written >= (int)sizeof(url)) {
+        ESP_LOGE(TAG, "Telegram URL buffer too small");
+        ESP_LOGE(TAG, "Telegram message failed");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char post_data[512] = {0};
+    written = snprintf(
+        post_data,
+        sizeof(post_data),
+        "{\"chat_id\":\"%s\",\"text\":\"%s\"}",
+        TELEGRAM_CHAT_ID,
+        message
+    );
+    if (written < 0 || written >= (int)sizeof(post_data)) {
+        ESP_LOGE(TAG, "Telegram POST buffer too small");
+        ESP_LOGE(TAG, "Telegram message failed");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 10000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "Telegram HTTP client init failed");
+        ESP_LOGE(TAG, "Telegram message failed");
+        return ESP_FAIL;
+    }
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, post_data, strlen(post_data));
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        if (status_code >= 200 && status_code < 300) {
+            ESP_LOGI(TAG, "Telegram message sent OK");
+        } else {
+            ESP_LOGE(TAG, "Telegram message failed, HTTP status=%d", status_code);
+            err = ESP_FAIL;
+        }
+    } else {
+        ESP_LOGE(TAG, "Telegram message failed: %s", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
+    return err;
 }
 
 esp_err_t board_gpio_init(void)
@@ -648,6 +733,7 @@ void vNetworkTask(void *pvParameters) {
     ESP_LOGI(TAG, "Network/Cloud Task Started");
     ESP_LOGI(TAG, "NetworkTask ready");
     bool ready_logged = false;
+    bool telegram_test_sent = false;
 
     while (1) {
         // Sau này: Gửi dữ liệu lên Server/App khi có tín hiệu từ alert_queue
@@ -671,6 +757,14 @@ void vNetworkTask(void *pvParameters) {
                 ESP_LOGI(TAG, "WiFi connected, ready for Telegram step");
                 ready_logged = true;
             }
+
+            if (!telegram_test_sent) {
+                esp_err_t err = telegram_send_message("ESP32 fall detection system online. Telegram test OK.");
+                if (err != ESP_OK) {
+                    ESP_LOGW(TAG, "Telegram test message attempt finished with error: %s", esp_err_to_name(err));
+                }
+                telegram_test_sent = true;
+            }
         } else if ((bits & WIFI_FAIL_BIT) != 0) {
             ESP_LOGW(TAG, "WiFi connection failed, retrying periodically");
             xEventGroupClearBits(wifi_event_group, WIFI_FAIL_BIT);
@@ -680,6 +774,8 @@ void vNetworkTask(void *pvParameters) {
         } else {
             ready_logged = false;
         }
+
+        vTaskDelay(pdMS_TO_TICKS(NETWORK_TASK_PERIOD_MS));
     }
 }
 

@@ -9,3 +9,4 @@ dependencies.lock
 
 # Bỏ qua thông tin WiFi thật
 main/wifi_credentials.h
+main/telegram_credentials.h
