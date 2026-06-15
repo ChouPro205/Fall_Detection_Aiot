@@ -25,6 +25,14 @@ static const uint8_t MPU6050_REG_WHO_AM_I = 0x75;
 static const uint8_t MPU6050_WHO_AM_I_VALUE = 0x68;
 static const float MPU6050_ACCEL_SCALE = 16384.0f;
 static const float MPU6050_GYRO_SCALE = 131.0f;
+static const float FREE_FALL_THRESHOLD_G = 0.5f;
+static const float IMPACT_THRESHOLD_G = 2.5f;
+static const float STABLE_ACCEL_MIN_G = 0.8f;
+static const float STABLE_ACCEL_MAX_G = 1.2f;
+static const float STABLE_GYRO_THRESHOLD_DPS = 30.0f;
+static const int64_t POSTURE_CHECK_TIME_MS = 3000;
+static const int64_t ALERT_COOLDOWN_MS = 10000;
+static const int64_t FREE_FALL_TIMEOUT_MS = 1000;
 static i2c_master_bus_handle_t i2c_bus_handle = NULL;
 static i2c_master_dev_handle_t mpu6050_dev_handle = NULL;
 
@@ -38,6 +46,14 @@ typedef struct {
     float gz_dps;
 } sensor_sample_t;
 
+typedef enum {
+    FALL_STATE_NORMAL,
+    FALL_STATE_FREE_FALL,
+    FALL_STATE_IMPACT,
+    FALL_STATE_POSTURE_CHECK,
+    FALL_STATE_CONFIRMED,
+} fall_state_t;
+
 void led_set(bool on);
 void buzzer_set(bool on);
 bool button_is_pressed(void);
@@ -48,6 +64,40 @@ esp_err_t mpu6050_read_reg(uint8_t reg, uint8_t *data);
 esp_err_t mpu6050_read_bytes(uint8_t start_reg, uint8_t *buffer, size_t len);
 esp_err_t mpu6050_init(void);
 esp_err_t mpu6050_read_raw(int16_t *ax, int16_t *ay, int16_t *az, int16_t *gx, int16_t *gy, int16_t *gz);
+
+static const char *fall_state_to_string(fall_state_t state)
+{
+    switch (state) {
+    case FALL_STATE_NORMAL:
+        return "NORMAL";
+    case FALL_STATE_FREE_FALL:
+        return "FREE_FALL";
+    case FALL_STATE_IMPACT:
+        return "IMPACT";
+    case FALL_STATE_POSTURE_CHECK:
+        return "POSTURE_CHECK";
+    case FALL_STATE_CONFIRMED:
+        return "CONFIRMED";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static void fall_state_transition(fall_state_t *state, fall_state_t next_state, int64_t timestamp_ms)
+{
+    if (*state == next_state) {
+        return;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Fall state: %s -> %s at t=%" PRId64 "ms",
+        fall_state_to_string(*state),
+        fall_state_to_string(next_state),
+        timestamp_ms
+    );
+    *state = next_state;
+}
 
 esp_err_t board_gpio_init(void)
 {
@@ -324,6 +374,11 @@ void vSensorTask(void *pvParameters) {
 void vInferenceTask(void *pvParameters) {
     ESP_LOGI(TAG, "AI Inference Task Started");
     TickType_t last_log_tick = 0;
+    fall_state_t fall_state = FALL_STATE_NORMAL;
+    int64_t free_fall_start_ms = 0;
+    int64_t impact_time_ms = 0;
+    int64_t stable_start_ms = 0;
+    int64_t last_alert_ms = -ALERT_COOLDOWN_MS;
 
     while (1) {
         // Sau này: Nhận dữ liệu từ sensor_data_queue và chạy model Edge Impulse
@@ -331,18 +386,18 @@ void vInferenceTask(void *pvParameters) {
         sensor_sample_t sample;
         if (xQueueReceive(sensor_data_queue, &sample, portMAX_DELAY) == pdPASS) {
             TickType_t now = xTaskGetTickCount();
-            if ((now - last_log_tick) >= pdMS_TO_TICKS(1000)) {
-                float accel_magnitude = sqrtf(
-                    (sample.ax_g * sample.ax_g) +
-                    (sample.ay_g * sample.ay_g) +
-                    (sample.az_g * sample.az_g)
-                );
-                float gyro_magnitude = sqrtf(
-                    (sample.gx_dps * sample.gx_dps) +
-                    (sample.gy_dps * sample.gy_dps) +
-                    (sample.gz_dps * sample.gz_dps)
-                );
+            float accel_magnitude = sqrtf(
+                (sample.ax_g * sample.ax_g) +
+                (sample.ay_g * sample.ay_g) +
+                (sample.az_g * sample.az_g)
+            );
+            float gyro_magnitude = sqrtf(
+                (sample.gx_dps * sample.gx_dps) +
+                (sample.gy_dps * sample.gy_dps) +
+                (sample.gz_dps * sample.gz_dps)
+            );
 
+            if ((now - last_log_tick) >= pdMS_TO_TICKS(1000)) {
                 ESP_LOGI(
                     TAG,
                     "Sensor sample: t=%" PRId64 "ms ax=%.3fg ay=%.3fg az=%.3fg gx=%.2fdps gy=%.2fdps gz=%.2fdps A=%.3fg G=%.2fdps",
@@ -357,6 +412,85 @@ void vInferenceTask(void *pvParameters) {
                     gyro_magnitude
                 );
                 last_log_tick = now;
+            }
+
+            switch (fall_state) {
+            case FALL_STATE_NORMAL:
+                stable_start_ms = 0;
+                if (accel_magnitude < FREE_FALL_THRESHOLD_G) {
+                    free_fall_start_ms = sample.timestamp_ms;
+                    fall_state_transition(&fall_state, FALL_STATE_FREE_FALL, sample.timestamp_ms);
+                } else if (accel_magnitude > IMPACT_THRESHOLD_G) {
+                    impact_time_ms = sample.timestamp_ms;
+                    fall_state_transition(&fall_state, FALL_STATE_IMPACT, sample.timestamp_ms);
+                }
+                break;
+
+            case FALL_STATE_FREE_FALL:
+                if (accel_magnitude > IMPACT_THRESHOLD_G) {
+                    impact_time_ms = sample.timestamp_ms;
+                    fall_state_transition(&fall_state, FALL_STATE_IMPACT, sample.timestamp_ms);
+                } else if ((sample.timestamp_ms - free_fall_start_ms) > FREE_FALL_TIMEOUT_MS) {
+                    free_fall_start_ms = 0;
+                    fall_state_transition(&fall_state, FALL_STATE_NORMAL, sample.timestamp_ms);
+                }
+                break;
+
+            case FALL_STATE_IMPACT:
+                stable_start_ms = 0;
+                fall_state_transition(&fall_state, FALL_STATE_POSTURE_CHECK, sample.timestamp_ms);
+                break;
+
+            case FALL_STATE_POSTURE_CHECK: {
+                bool posture_stable =
+                    (accel_magnitude >= STABLE_ACCEL_MIN_G) &&
+                    (accel_magnitude <= STABLE_ACCEL_MAX_G) &&
+                    (gyro_magnitude < STABLE_GYRO_THRESHOLD_DPS);
+
+                if (posture_stable) {
+                    if (stable_start_ms == 0) {
+                        stable_start_ms = sample.timestamp_ms;
+                    }
+
+                    if ((sample.timestamp_ms - stable_start_ms) >= POSTURE_CHECK_TIME_MS) {
+                        fall_state_transition(&fall_state, FALL_STATE_CONFIRMED, sample.timestamp_ms);
+                    }
+                } else {
+                    stable_start_ms = 0;
+                    if ((sample.timestamp_ms - impact_time_ms) >= POSTURE_CHECK_TIME_MS) {
+                        fall_state_transition(&fall_state, FALL_STATE_NORMAL, sample.timestamp_ms);
+                    }
+                }
+                break;
+            }
+
+            case FALL_STATE_CONFIRMED:
+                if ((sample.timestamp_ms - last_alert_ms) >= ALERT_COOLDOWN_MS) {
+                    ESP_LOGW(TAG, "FALL DETECTED at t=%" PRId64 "ms", sample.timestamp_ms);
+                    last_alert_ms = sample.timestamp_ms;
+
+                    if (alert_queue != NULL) {
+                        bool alert_event = true;
+                        if (xQueueSend(alert_queue, &alert_event, 0) != pdPASS) {
+                            ESP_LOGW(TAG, "alert_queue full, dropping alert event");
+                        }
+                    }
+                } else {
+                    ESP_LOGW(TAG, "Fall detected during cooldown, alert suppressed");
+                }
+
+                free_fall_start_ms = 0;
+                impact_time_ms = 0;
+                stable_start_ms = 0;
+                fall_state_transition(&fall_state, FALL_STATE_NORMAL, sample.timestamp_ms);
+                break;
+
+            default:
+                free_fall_start_ms = 0;
+                impact_time_ms = 0;
+                stable_start_ms = 0;
+                fall_state_transition(&fall_state, FALL_STATE_NORMAL, sample.timestamp_ms);
+                break;
             }
         }
     }
@@ -387,6 +521,13 @@ void vSystemMonitorTask(void *pvParameters) {
         if (button_pressed != last_button_pressed) {
             ESP_LOGI(TAG, "Button: %s", button_pressed ? "PRESSED" : "RELEASED");
             last_button_pressed = button_pressed;
+        }
+
+        bool alert_event = false;
+        while (alert_queue != NULL && xQueueReceive(alert_queue, &alert_event, 0) == pdPASS) {
+            if (alert_event) {
+                ESP_LOGI(TAG, "Alert event received");
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));
