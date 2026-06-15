@@ -3,6 +3,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include "app_config.h"
 
 static const char *TAG = "FALL_DETECTION_SYSTEM";
 

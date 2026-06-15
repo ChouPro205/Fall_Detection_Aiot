@@ -1,0 +1,17 @@
+#ifndef APP_CONFIG_H
+#define APP_CONFIG_H
+
+#define MPU6050_SDA_GPIO 21
+#define MPU6050_SCL_GPIO 22
+#define MPU6050_INT_GPIO 19
+
+#define LED_GPIO 26
+#define BUZZER_GPIO 27
+#define BUTTON_GPIO 32
+
+#define MPU6050_I2C_ADDR 0x68
+
+#define SENSOR_SAMPLE_RATE_HZ 50
+#define SENSOR_SAMPLE_PERIOD_MS 20
+
+#endif // APP_CONFIG_H
