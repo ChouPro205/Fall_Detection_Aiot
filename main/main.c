@@ -33,6 +33,12 @@ static const float STABLE_GYRO_THRESHOLD_DPS = 30.0f;
 static const int64_t POSTURE_CHECK_TIME_MS = 3000;
 static const int64_t ALERT_COOLDOWN_MS = 10000;
 static const int64_t FREE_FALL_TIMEOUT_MS = 1000;
+static const int64_t LOCAL_WARNING_TIMEOUT_MS = 10000;
+static const int64_t ALERT_LED_TOGGLE_PERIOD_MS = 250;
+static const int64_t ALERT_BUZZER_PERIOD_MS = 500;
+static const int64_t ALERT_BUZZER_ON_TIME_MS = 120;
+static const int64_t BUTTON_DEBOUNCE_MS = 50;
+static const int64_t SYSTEM_MONITOR_PERIOD_MS = 50;
 static i2c_master_bus_handle_t i2c_bus_handle = NULL;
 static i2c_master_dev_handle_t mpu6050_dev_handle = NULL;
 
@@ -53,6 +59,13 @@ typedef enum {
     FALL_STATE_POSTURE_CHECK,
     FALL_STATE_CONFIRMED,
 } fall_state_t;
+
+typedef enum {
+    ALERT_STATE_IDLE,
+    ALERT_STATE_LOCAL_WARNING,
+    ALERT_STATE_CANCELLED,
+    ALERT_STATE_CONFIRMED,
+} alert_state_t;
 
 void led_set(bool on);
 void buzzer_set(bool on);
@@ -512,25 +525,103 @@ void vSystemMonitorTask(void *pvParameters) {
     led_set(false);
     buzzer_set(false);
 
-    bool last_button_pressed = button_is_pressed();
+    alert_state_t alert_state = ALERT_STATE_IDLE;
+    int64_t alert_start_ms = 0;
+    int64_t last_led_toggle_ms = 0;
+    bool led_on = false;
+
+    bool raw_button_pressed = button_is_pressed();
+    bool last_raw_button_pressed = raw_button_pressed;
+    bool debounced_button_pressed = raw_button_pressed;
+    bool last_logged_button_pressed = debounced_button_pressed;
+    int64_t button_last_change_ms = esp_timer_get_time() / 1000;
 
     while (1) {
         // Sau này: Đọc ADC kiểm tra pin (TP4056), chớp LED trạng thái
         // Kích hoạt loa (Buzzer) nếu phát hiện té ngã
-        bool button_pressed = button_is_pressed();
-        if (button_pressed != last_button_pressed) {
-            ESP_LOGI(TAG, "Button: %s", button_pressed ? "PRESSED" : "RELEASED");
-            last_button_pressed = button_pressed;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+
+        raw_button_pressed = button_is_pressed();
+        if (raw_button_pressed != last_raw_button_pressed) {
+            last_raw_button_pressed = raw_button_pressed;
+            button_last_change_ms = now_ms;
+        }
+
+        if ((raw_button_pressed != debounced_button_pressed) &&
+            ((now_ms - button_last_change_ms) >= BUTTON_DEBOUNCE_MS)) {
+            debounced_button_pressed = raw_button_pressed;
+        }
+
+        if (debounced_button_pressed != last_logged_button_pressed) {
+            ESP_LOGI(TAG, "Button: %s", debounced_button_pressed ? "PRESSED" : "RELEASED");
+            last_logged_button_pressed = debounced_button_pressed;
         }
 
         bool alert_event = false;
         while (alert_queue != NULL && xQueueReceive(alert_queue, &alert_event, 0) == pdPASS) {
             if (alert_event) {
                 ESP_LOGI(TAG, "Alert event received");
+                if (alert_state == ALERT_STATE_IDLE) {
+                    alert_state = ALERT_STATE_LOCAL_WARNING;
+                    alert_start_ms = now_ms;
+                    last_led_toggle_ms = now_ms;
+                    led_on = true;
+                    led_set(led_on);
+                    buzzer_set(true);
+                    ESP_LOGW(TAG, "Local fall warning started");
+                }
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+        switch (alert_state) {
+        case ALERT_STATE_IDLE:
+            led_on = false;
+            led_set(false);
+            buzzer_set(false);
+            break;
+
+        case ALERT_STATE_LOCAL_WARNING:
+            if ((now_ms - last_led_toggle_ms) >= ALERT_LED_TOGGLE_PERIOD_MS) {
+                led_on = !led_on;
+                led_set(led_on);
+                last_led_toggle_ms = now_ms;
+            }
+
+            buzzer_set(((now_ms - alert_start_ms) % ALERT_BUZZER_PERIOD_MS) < ALERT_BUZZER_ON_TIME_MS);
+
+            if (debounced_button_pressed) {
+                alert_state = ALERT_STATE_CANCELLED;
+            } else if ((now_ms - alert_start_ms) >= LOCAL_WARNING_TIMEOUT_MS) {
+                alert_state = ALERT_STATE_CONFIRMED;
+            }
+            break;
+
+        case ALERT_STATE_CANCELLED:
+            led_on = false;
+            led_set(false);
+            buzzer_set(false);
+            ESP_LOGI(TAG, "Fall alert cancelled by button");
+            alert_state = ALERT_STATE_IDLE;
+            break;
+
+        case ALERT_STATE_CONFIRMED:
+            led_on = false;
+            led_set(false);
+            buzzer_set(false);
+            ESP_LOGW(TAG, "Fall alert confirmed");
+            ESP_LOGI(TAG, "Network alert will be handled in next step");
+            alert_state = ALERT_STATE_IDLE;
+            break;
+
+        default:
+            led_on = false;
+            led_set(false);
+            buzzer_set(false);
+            alert_state = ALERT_STATE_IDLE;
+            break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(SYSTEM_MONITOR_PERIOD_MS));
     }
 }
 
