@@ -3,15 +3,27 @@
 #include <inttypes.h>
 #include <math.h>
 #include <stdint.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/event_groups.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_err.h"
+#include "esp_event.h"
 #include "esp_log.h"
+#include "esp_netif.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
+#include "nvs_flash.h"
 #include "app_config.h"
+
+#if __has_include("wifi_credentials.h")
+#include "wifi_credentials.h"
+#else
+#include "wifi_credentials_example.h"
+#endif
 
 static const char *TAG = "FALL_DETECTION_SYSTEM";
 static const int I2C_SCAN_TIMEOUT_MS = 50;
@@ -39,8 +51,14 @@ static const int64_t ALERT_BUZZER_PERIOD_MS = 500;
 static const int64_t ALERT_BUZZER_ON_TIME_MS = 120;
 static const int64_t BUTTON_DEBOUNCE_MS = 50;
 static const int64_t SYSTEM_MONITOR_PERIOD_MS = 50;
+static const int WIFI_MAXIMUM_RETRY = 5;
+static const int NETWORK_TASK_PERIOD_MS = 5000;
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT BIT1
 static i2c_master_bus_handle_t i2c_bus_handle = NULL;
 static i2c_master_dev_handle_t mpu6050_dev_handle = NULL;
+static EventGroupHandle_t wifi_event_group = NULL;
+static int wifi_retry_count = 0;
 
 typedef struct {
     int64_t timestamp_ms;
@@ -70,8 +88,10 @@ typedef enum {
 void led_set(bool on);
 void buzzer_set(bool on);
 bool button_is_pressed(void);
+esp_err_t app_nvs_init(void);
 esp_err_t board_i2c_init(void);
 void i2c_scan(void);
+esp_err_t wifi_init_sta(void);
 esp_err_t mpu6050_write_reg(uint8_t reg, uint8_t data);
 esp_err_t mpu6050_read_reg(uint8_t reg, uint8_t *data);
 esp_err_t mpu6050_read_bytes(uint8_t start_reg, uint8_t *buffer, size_t len);
@@ -110,6 +130,120 @@ static void fall_state_transition(fall_state_t *state, fall_state_t next_state, 
         timestamp_ms
     );
     *state = next_state;
+}
+
+esp_err_t app_nvs_init(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS init failed, erasing NVS partition");
+        err = nvs_flash_erase();
+        if (err != ESP_OK) {
+            return err;
+        }
+        err = nvs_flash_init();
+    }
+
+    return err;
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    (void)arg;
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "WiFi connecting...");
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (wifi_event_group != NULL) {
+            xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        }
+
+        if (wifi_retry_count < WIFI_MAXIMUM_RETRY) {
+            wifi_retry_count++;
+            ESP_LOGW(TAG, "WiFi disconnected, reconnecting (%d/%d)", wifi_retry_count, WIFI_MAXIMUM_RETRY);
+            esp_wifi_connect();
+        } else {
+            ESP_LOGW(TAG, "WiFi disconnected, max retry reached");
+            if (wifi_event_group != NULL) {
+                xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+            }
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        wifi_retry_count = 0;
+        if (wifi_event_group != NULL) {
+            xEventGroupClearBits(wifi_event_group, WIFI_FAIL_BIT);
+            xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        }
+    }
+}
+
+esp_err_t wifi_init_sta(void)
+{
+    wifi_event_group = xEventGroupCreate();
+    if (wifi_event_group == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        return err;
+    }
+
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    if (sta_netif == NULL) {
+        return ESP_FAIL;
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    err = esp_wifi_init(&cfg);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    wifi_config_t wifi_config = {0};
+    snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%s", WIFI_SSID);
+    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%s", WIFI_PASSWORD);
+    wifi_config.sta.threshold.authmode = strlen(WIFI_PASSWORD) == 0 ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+
+    if (strcmp(WIFI_SSID, "YOUR_WIFI_SSID") == 0) {
+        ESP_LOGW(TAG, "Using placeholder WiFi credentials. Create main/wifi_credentials.h before flashing real hardware.");
+    }
+
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_wifi_start();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    ESP_LOGI(TAG, "WiFi station initialized");
+    return ESP_OK;
 }
 
 esp_err_t board_gpio_init(void)
@@ -512,10 +646,40 @@ void vInferenceTask(void *pvParameters) {
 // --- TASK 3: Kết nối mạng & Cảnh báo từ xa (WiFi/MQTT) ---
 void vNetworkTask(void *pvParameters) {
     ESP_LOGI(TAG, "Network/Cloud Task Started");
+    ESP_LOGI(TAG, "NetworkTask ready");
+    bool ready_logged = false;
+
     while (1) {
         // Sau này: Gửi dữ liệu lên Server/App khi có tín hiệu từ alert_queue
         // Task này cần stack lớn hơn vì chạy WiFi stack
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (wifi_event_group == NULL) {
+            ESP_LOGW(TAG, "WiFi event group is not initialized");
+            vTaskDelay(pdMS_TO_TICKS(NETWORK_TASK_PERIOD_MS));
+            continue;
+        }
+
+        EventBits_t bits = xEventGroupWaitBits(
+            wifi_event_group,
+            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+            pdFALSE,
+            pdFALSE,
+            pdMS_TO_TICKS(NETWORK_TASK_PERIOD_MS)
+        );
+
+        if ((bits & WIFI_CONNECTED_BIT) != 0) {
+            if (!ready_logged) {
+                ESP_LOGI(TAG, "WiFi connected, ready for Telegram step");
+                ready_logged = true;
+            }
+        } else if ((bits & WIFI_FAIL_BIT) != 0) {
+            ESP_LOGW(TAG, "WiFi connection failed, retrying periodically");
+            xEventGroupClearBits(wifi_event_group, WIFI_FAIL_BIT);
+            wifi_retry_count = 0;
+            ready_logged = false;
+            esp_wifi_connect();
+        } else {
+            ready_logged = false;
+        }
     }
 }
 
@@ -630,7 +794,13 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Initializing Fall Detection System...");
 
-    esp_err_t err = board_gpio_init();
+    esp_err_t err = app_nvs_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize NVS: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = board_gpio_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize board GPIO: %s", esp_err_to_name(err));
         return;
@@ -650,6 +820,12 @@ void app_main(void)
     }
 
     // 1. Khởi tạo các Queue (Truyền tin giữa các Task)
+    err = wifi_init_sta();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize WiFi station: %s", esp_err_to_name(err));
+        return;
+    }
+
     sensor_data_queue = xQueueCreate(10, sizeof(sensor_sample_t)); // Normalized sensor samples
     alert_queue = xQueueCreate(5, sizeof(bool));            // Chứa trạng thái Té ngã (True/False)
 

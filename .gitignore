@@ -6,3 +6,6 @@ dependencies.lock
 
 # Bỏ qua cài đặt máy cá nhân
 .vscode/
+
+# Bỏ qua thông tin WiFi thật
+main/wifi_credentials.h
