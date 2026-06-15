@@ -4,15 +4,20 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "app_config.h"
 
 static const char *TAG = "FALL_DETECTION_SYSTEM";
+static const int I2C_SCAN_TIMEOUT_MS = 50;
+static i2c_master_bus_handle_t i2c_bus_handle = NULL;
 
 void led_set(bool on);
 void buzzer_set(bool on);
 bool button_is_pressed(void);
+esp_err_t board_i2c_init(void);
+void i2c_scan(void);
 
 esp_err_t board_gpio_init(void)
 {
@@ -61,6 +66,49 @@ void buzzer_set(bool on)
 bool button_is_pressed(void)
 {
     return gpio_get_level(BUTTON_GPIO) == 0;
+}
+
+esp_err_t board_i2c_init(void)
+{
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = (gpio_num_t)MPU6050_SDA_GPIO,
+        .scl_io_num = (gpio_num_t)MPU6050_SCL_GPIO,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .intr_priority = 0,
+        .trans_queue_depth = 0,
+        .flags.enable_internal_pullup = true,
+    };
+
+    return i2c_new_master_bus(&bus_config, &i2c_bus_handle);
+}
+
+void i2c_scan(void)
+{
+    if (i2c_bus_handle == NULL) {
+        ESP_LOGE(TAG, "I2C bus is not initialized");
+        return;
+    }
+
+    bool device_found = false;
+    ESP_LOGI(TAG, "Scanning I2C bus...");
+
+    for (uint8_t address = 0x03; address <= 0x77; address++) {
+        esp_err_t err = i2c_master_probe(i2c_bus_handle, address, I2C_SCAN_TIMEOUT_MS);
+        if (err == ESP_OK) {
+            device_found = true;
+            ESP_LOGI(TAG, "I2C device found at address 0x%02X", address);
+
+            if (address == MPU6050_I2C_ADDR) {
+                ESP_LOGI(TAG, "MPU6050 found");
+            }
+        }
+    }
+
+    if (!device_found) {
+        ESP_LOGW(TAG, "No I2C devices found. Check SDA/SCL/3V3/GND.");
+    }
 }
 
 // --- KHAI BÁO HÀNG ĐỢI (QUEUES) ---
@@ -130,6 +178,13 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to initialize board GPIO: %s", esp_err_to_name(err));
         return;
     }
+
+    err = board_i2c_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize I2C master: %s", esp_err_to_name(err));
+        return;
+    }
+    i2c_scan();
 
     // 1. Khởi tạo các Queue (Truyền tin giữa các Task)
     sensor_data_queue = xQueueCreate(10, sizeof(float) * 6); // Chứa 6 trục dữ liệu
