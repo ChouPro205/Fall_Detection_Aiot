@@ -60,7 +60,7 @@ static const int64_t ALERT_BUZZER_ON_TIME_MS = 120;
 static const int64_t BUTTON_DEBOUNCE_MS = 50;
 static const int64_t SYSTEM_MONITOR_PERIOD_MS = 50;
 static const int WIFI_MAXIMUM_RETRY = 5;
-static const int NETWORK_TASK_PERIOD_MS = 5000;
+static const int64_t NETWORK_ALERT_COOLDOWN_MS = 30000;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
 static i2c_master_bus_handle_t i2c_bus_handle = NULL;
@@ -553,6 +553,7 @@ esp_err_t mpu6050_read_raw(int16_t *ax, int16_t *ay, int16_t *az, int16_t *gx, i
 QueueHandle_t sensor_data_queue;
 // Dùng để truyền kết quả từ Task AI sang Task phát cảnh báo
 QueueHandle_t alert_queue;
+QueueHandle_t network_alert_queue;
 
 // --- TASK 1: Đọc cảm biến (Mức ưu tiên cao nhất - Real-time) ---
 void vSensorTask(void *pvParameters) {
@@ -734,13 +735,19 @@ void vNetworkTask(void *pvParameters) {
     ESP_LOGI(TAG, "NetworkTask ready");
     bool ready_logged = false;
     bool telegram_test_sent = false;
+    int64_t last_network_alert_ms = -NETWORK_ALERT_COOLDOWN_MS;
+    const char *fall_alert_message =
+        "CANH BAO TE NGA!\n"
+        "ESP32 da xac nhan su kien te nga.\n"
+        "Nguoi dung khong bam nut huy.\n"
+        "Vui long kiem tra ngay.";
 
     while (1) {
         // Sau này: Gửi dữ liệu lên Server/App khi có tín hiệu từ alert_queue
         // Task này cần stack lớn hơn vì chạy WiFi stack
         if (wifi_event_group == NULL) {
             ESP_LOGW(TAG, "WiFi event group is not initialized");
-            vTaskDelay(pdMS_TO_TICKS(NETWORK_TASK_PERIOD_MS));
+            vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
 
@@ -749,7 +756,7 @@ void vNetworkTask(void *pvParameters) {
             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
             pdFALSE,
             pdFALSE,
-            pdMS_TO_TICKS(NETWORK_TASK_PERIOD_MS)
+            pdMS_TO_TICKS(1000)
         );
 
         if ((bits & WIFI_CONNECTED_BIT) != 0) {
@@ -765,6 +772,23 @@ void vNetworkTask(void *pvParameters) {
                 }
                 telegram_test_sent = true;
             }
+
+            bool confirmed_fall_event = false;
+            if (network_alert_queue != NULL &&
+                xQueueReceive(network_alert_queue, &confirmed_fall_event, pdMS_TO_TICKS(1000)) == pdPASS &&
+                confirmed_fall_event) {
+                int64_t now_ms = esp_timer_get_time() / 1000;
+                if ((now_ms - last_network_alert_ms) >= NETWORK_ALERT_COOLDOWN_MS) {
+                    esp_err_t err = telegram_send_message(fall_alert_message);
+                    if (err == ESP_OK) {
+                        last_network_alert_ms = now_ms;
+                    } else {
+                        ESP_LOGW(TAG, "Fall Telegram alert failed: %s", esp_err_to_name(err));
+                    }
+                } else {
+                    ESP_LOGW(TAG, "Fall Telegram alert suppressed by cooldown");
+                }
+            }
         } else if ((bits & WIFI_FAIL_BIT) != 0) {
             ESP_LOGW(TAG, "WiFi connection failed, retrying periodically");
             xEventGroupClearBits(wifi_event_group, WIFI_FAIL_BIT);
@@ -774,8 +798,6 @@ void vNetworkTask(void *pvParameters) {
         } else {
             ready_logged = false;
         }
-
-        vTaskDelay(pdMS_TO_TICKS(NETWORK_TASK_PERIOD_MS));
     }
 }
 
@@ -869,7 +891,12 @@ void vSystemMonitorTask(void *pvParameters) {
             led_set(false);
             buzzer_set(false);
             ESP_LOGW(TAG, "Fall alert confirmed");
-            ESP_LOGI(TAG, "Network alert will be handled in next step");
+            if (network_alert_queue != NULL) {
+                bool confirmed_fall_event = true;
+                if (xQueueSend(network_alert_queue, &confirmed_fall_event, 0) != pdPASS) {
+                    ESP_LOGW(TAG, "network_alert_queue full, dropping confirmed fall event");
+                }
+            }
             alert_state = ALERT_STATE_IDLE;
             break;
 
@@ -927,12 +954,18 @@ void app_main(void)
 
     // 2. Tạo các Task
     // Task đọc cảm biến (Priority: 5) - Cần chạy cực kỳ đúng giờ
+    network_alert_queue = xQueueCreate(3, sizeof(bool));
+
     if (sensor_data_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create sensor_data_queue");
         return;
     }
     if (alert_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create alert_queue");
+        return;
+    }
+    if (network_alert_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create network_alert_queue");
         return;
     }
     if (xTaskCreate(vSensorTask, "Sensor_Read", 4096, NULL, 5, NULL) != pdPASS) {
