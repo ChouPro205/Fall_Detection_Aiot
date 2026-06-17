@@ -607,6 +607,9 @@ void vSensorTask(void *pvParameters) {
 void vInferenceTask(void *pvParameters) {
     ESP_LOGI(TAG, "AI Inference Task Started");
     TickType_t last_log_tick = 0;
+#if ENABLE_SENSOR_CSV_LOG
+    bool csv_header_printed = false;
+#endif
     fall_state_t fall_state = FALL_STATE_NORMAL;
     int64_t free_fall_start_ms = 0;
     int64_t impact_time_ms = 0;
@@ -629,6 +632,27 @@ void vInferenceTask(void *pvParameters) {
                 (sample.gy_dps * sample.gy_dps) +
                 (sample.gz_dps * sample.gz_dps)
             );
+
+#if ENABLE_SENSOR_CSV_LOG
+            if (!csv_header_printed) {
+                puts("timestamp_ms,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,A,G,label");
+                csv_header_printed = true;
+            }
+
+            printf(
+                "%" PRId64 ",%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%s\n",
+                sample.timestamp_ms,
+                sample.ax_g,
+                sample.ay_g,
+                sample.az_g,
+                sample.gx_dps,
+                sample.gy_dps,
+                sample.gz_dps,
+                accel_magnitude,
+                gyro_magnitude,
+                SENSOR_CSV_LABEL
+            );
+#endif
 
             if ((now - last_log_tick) >= pdMS_TO_TICKS(1000)) {
                 ESP_LOGI(

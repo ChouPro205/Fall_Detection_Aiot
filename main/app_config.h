@@ -14,4 +14,7 @@
 #define SENSOR_SAMPLE_RATE_HZ 50
 #define SENSOR_SAMPLE_PERIOD_MS 20
 
+#define ENABLE_SENSOR_CSV_LOG 0
+#define SENSOR_CSV_LABEL "fall_soft"
+
 #endif // APP_CONFIG_H
