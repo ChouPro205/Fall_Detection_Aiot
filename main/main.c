@@ -20,6 +20,9 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "app_config.h"
+#if ENABLE_EDGE_IMPULSE_MODEL
+#include "ei_inference_wrapper.h"
+#endif
 
 #if __has_include("wifi_credentials.h")
 #include "wifi_credentials.h"
@@ -61,6 +64,11 @@ static const int64_t BUTTON_DEBOUNCE_MS = 50;
 static const int64_t SYSTEM_MONITOR_PERIOD_MS = 50;
 static const int WIFI_MAXIMUM_RETRY = 5;
 static const int64_t NETWORK_ALERT_COOLDOWN_MS = 30000;
+#define EDGE_IMPULSE_WINDOW_SAMPLES 100
+#define EDGE_IMPULSE_WINDOW_STEP_SAMPLES 25
+#define EDGE_IMPULSE_FEATURES_PER_SAMPLE 8
+#define EDGE_IMPULSE_WINDOW_FEATURES (EDGE_IMPULSE_WINDOW_SAMPLES * EDGE_IMPULSE_FEATURES_PER_SAMPLE)
+#define EDGE_IMPULSE_STEP_FEATURES (EDGE_IMPULSE_WINDOW_STEP_SAMPLES * EDGE_IMPULSE_FEATURES_PER_SAMPLE)
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
 static i2c_master_bus_handle_t i2c_bus_handle = NULL;
@@ -615,6 +623,22 @@ void vInferenceTask(void *pvParameters) {
     int64_t impact_time_ms = 0;
     int64_t stable_start_ms = 0;
     int64_t last_alert_ms = -ALERT_COOLDOWN_MS;
+#if ENABLE_EDGE_IMPULSE_MODEL
+    static float ei_features[EDGE_IMPULSE_WINDOW_FEATURES];
+    size_t ei_feature_index = 0;
+    unsigned int ei_consecutive_fall_windows = 0;
+    const bool ei_feature_count_valid =
+        ei_fall_get_feature_count() == EDGE_IMPULSE_WINDOW_FEATURES;
+
+    if (!ei_feature_count_valid) {
+        ESP_LOGE(
+            TAG,
+            "Edge Impulse feature count mismatch: model=%u expected=%u",
+            (unsigned int)ei_fall_get_feature_count(),
+            (unsigned int)EDGE_IMPULSE_WINDOW_FEATURES
+        );
+    }
+#endif
 
     while (1) {
         // Sau này: Nhận dữ liệu từ sensor_data_queue và chạy model Edge Impulse
@@ -671,6 +695,72 @@ void vInferenceTask(void *pvParameters) {
                 last_log_tick = now;
             }
 
+            bool ai_fall_detected = false;
+#if ENABLE_EDGE_IMPULSE_MODEL
+            if (ei_feature_count_valid) {
+                const float feature_values[EDGE_IMPULSE_FEATURES_PER_SAMPLE] = {
+                    sample.ax_g,
+                    sample.ay_g,
+                    sample.az_g,
+                    sample.gx_dps,
+                    sample.gy_dps,
+                    sample.gz_dps,
+                    accel_magnitude,
+                    gyro_magnitude,
+                };
+
+                memcpy(
+                    &ei_features[ei_feature_index],
+                    feature_values,
+                    sizeof(feature_values)
+                );
+                ei_feature_index += EDGE_IMPULSE_FEATURES_PER_SAMPLE;
+
+                if (ei_feature_index == EDGE_IMPULSE_WINDOW_FEATURES) {
+                    ei_fall_result_t ei_result;
+                    if (ei_fall_run_classifier_from_features(
+                            ei_features,
+                            EDGE_IMPULSE_WINDOW_FEATURES,
+                            &ei_result)) {
+                        ESP_LOGI(
+                            TAG,
+                            "EI: fall_soft=%.3f lying=%.3f normal=%.3f shake=%.3f pred=%s",
+                            ei_result.fall_soft,
+                            ei_result.lying,
+                            ei_result.normal,
+                            ei_result.shake,
+                            ei_result.predicted_label
+                        );
+
+                        if (ei_result.fall_soft >= EDGE_IMPULSE_FALL_THRESHOLD) {
+                            ei_consecutive_fall_windows++;
+                        } else {
+                            ei_consecutive_fall_windows = 0;
+                        }
+
+                        if (ei_consecutive_fall_windows >=
+                            EDGE_IMPULSE_REQUIRED_CONSECUTIVE_WINDOWS) {
+                            ai_fall_detected = true;
+                            ei_consecutive_fall_windows = 0;
+                        }
+                    } else {
+                        ESP_LOGE(TAG, "Edge Impulse classifier failed");
+                        ei_consecutive_fall_windows = 0;
+                    }
+
+                    memmove(
+                        ei_features,
+                        &ei_features[EDGE_IMPULSE_STEP_FEATURES],
+                        (EDGE_IMPULSE_WINDOW_FEATURES - EDGE_IMPULSE_STEP_FEATURES) *
+                            sizeof(ei_features[0])
+                    );
+                    ei_feature_index =
+                        EDGE_IMPULSE_WINDOW_FEATURES - EDGE_IMPULSE_STEP_FEATURES;
+                }
+            }
+#endif
+
+            bool rule_based_fall_detected = false;
             switch (fall_state) {
             case FALL_STATE_NORMAL:
                 stable_start_ms = 0;
@@ -722,19 +812,7 @@ void vInferenceTask(void *pvParameters) {
             }
 
             case FALL_STATE_CONFIRMED:
-                if ((sample.timestamp_ms - last_alert_ms) >= ALERT_COOLDOWN_MS) {
-                    ESP_LOGW(TAG, "FALL DETECTED at t=%" PRId64 "ms", sample.timestamp_ms);
-                    last_alert_ms = sample.timestamp_ms;
-
-                    if (alert_queue != NULL) {
-                        bool alert_event = true;
-                        if (xQueueSend(alert_queue, &alert_event, 0) != pdPASS) {
-                            ESP_LOGW(TAG, "alert_queue full, dropping alert event");
-                        }
-                    }
-                } else {
-                    ESP_LOGW(TAG, "Fall detected during cooldown, alert suppressed");
-                }
+                rule_based_fall_detected = true;
 
                 free_fall_start_ms = 0;
                 impact_time_ms = 0;
@@ -748,6 +826,29 @@ void vInferenceTask(void *pvParameters) {
                 stable_start_ms = 0;
                 fall_state_transition(&fall_state, FALL_STATE_NORMAL, sample.timestamp_ms);
                 break;
+            }
+
+            bool fall_detected = rule_based_fall_detected || ai_fall_detected;
+            if (fall_detected) {
+                if ((sample.timestamp_ms - last_alert_ms) >= ALERT_COOLDOWN_MS) {
+                    ESP_LOGW(
+                        TAG,
+                        "FALL DETECTED at t=%" PRId64 "ms (rule=%d ai=%d)",
+                        sample.timestamp_ms,
+                        rule_based_fall_detected,
+                        ai_fall_detected
+                    );
+                    last_alert_ms = sample.timestamp_ms;
+
+                    if (alert_queue != NULL) {
+                        bool alert_event = true;
+                        if (xQueueSend(alert_queue, &alert_event, 0) != pdPASS) {
+                            ESP_LOGW(TAG, "alert_queue full, dropping alert event");
+                        }
+                    }
+                } else {
+                    ESP_LOGW(TAG, "Fall detected during cooldown, alert suppressed");
+                }
             }
         }
     }

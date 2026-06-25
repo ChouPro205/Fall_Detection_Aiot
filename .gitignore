@@ -10,3 +10,4 @@ dependencies.lock
 # Bỏ qua thông tin WiFi thật
 main/wifi_credentials.h
 main/telegram_credentials.h
+edge_impulse_export.zip
