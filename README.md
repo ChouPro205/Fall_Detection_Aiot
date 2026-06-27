@@ -83,13 +83,13 @@ Một trong hai bộ phát hiện đều có thể tạo sự kiện té ngã. C
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Giám sát bình thường
-    Giám sát bình thường --> CanhBaoTaiCho: Phát hiện té ngã
+    [*] --> Chờ
+    Chờ --> CanhBaoTaiCho: Phát hiện té ngã
     CanhBaoTaiCho --> DaHuy: Nhấn nút trong 10 giây
     CanhBaoTaiCho --> DaXacNhan: Hết thời gian 10 giây
-    DaHuy --> Giám sát bình thường
+    DaHuy --> Chờ
     DaXacNhan --> GuiTelegram
-    GuiTelegram --> Giám sát bình thường
+    GuiTelegram --> Chờ
 ```
 
 Luồng phát hiện có thời gian chờ 10 giây giữa các cảnh báo. Thông báo từ xa sử dụng khoảng chờ riêng là 30 giây.
